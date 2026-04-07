@@ -14,6 +14,7 @@ Thumbs.db
 # === Go (backend) ===
 # Build artifacts (adjust if your Go output goes elsewhere)
 /backend/bin/
+/backend/data/
 /backend/dist/
 /backend/*.exe
 /backend/*.dll
