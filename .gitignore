@@ -34,6 +34,7 @@ Thumbs.db
 /frontend/.pnp
 /frontend/.pnp.js
 /frontend/.yarn-integrity
+/frontend/package-lock.json
 
 # Build outputs (React)
 /frontend/build/
