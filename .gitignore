@@ -1,0 +1,62 @@
+# === macOS (system files – appear anywhere) ===
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+*.swp
+*.swo
+*~
+
+# === Go (backend) ===
+# Build artifacts (adjust if your Go output goes elsewhere)
+/backend/bin/
+/backend/dist/
+/backend/*.exe
+/backend/*.dll
+/backend/*.so
+/backend/*.dylib
+/backend/*.test
+/backend/coverage.out
+
+# Go vendor & workspace files
+/backend/vendor/
+/backend/go.work
+/backend/go.work.sum
+
+# === Node.js / React (frontend) ===
+# Dependencies
+/frontend/node_modules/
+/frontend/.pnp
+/frontend/.pnp.js
+/frontend/.yarn-integrity
+
+# Build outputs (React)
+/frontend/build/
+/frontend/dist/
+/frontend/.next/
+/frontend/out/
+
+# Logs
+/frontend/npm-debug.log*
+/frontend/yarn-debug.log*
+/frontend/yarn-error.log*
+/frontend/lerna-debug.log*
+/frontend/.pnpm-debug.log*
+
+# Environment files
+/frontend/.env
+/frontend/.env.local
+/frontend/.env.*.local
+
+# Cache
+/frontend/.cache/
+/frontend/.parcel-cache/
+/frontend/.eslintcache
+
+# Testing coverage
+/frontend/coverage/
+
