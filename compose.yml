@@ -1,0 +1,77 @@
+# compose.yml
+#
+# Usage:
+#   docker compose up -d
+#
+# The container is NOT exposed to the internet directly.
+# nginx on the host proxies to 127.0.0.1:8080.
+# See deploy/nginx.conf for the nginx configuration.
+
+services:
+  trade:
+    image: interstellar-trade:latest
+    build:
+      context: .
+      dockerfile: Dockerfile
+    restart: unless-stopped
+
+    # Bind only to loopback — nginx on the host reaches this port;
+    # nothing else on the internet does.
+    ports:
+      - "127.0.0.1:8080:8080"
+
+    # Persistent state: the JSON data file survives container rebuilds.
+    volumes:
+      - trade-data:/data
+
+    # Override the CORS origin without rebuilding the image.
+    # Set this in a .env file (never commit secrets there).
+    environment:
+      - CORS_ORIGINS=${CORS_ORIGINS:-https://yourdomain.com}
+
+    # Pass env var into the binary via the entrypoint wrapper script.
+    # (The Go binary reads --cors from argv; the wrapper converts the env var.)
+    entrypoint: ["/interstellar-trade",
+                 "--addr",   ":8080",
+                 "--data",   "/data/state.json",
+                 "--static", "/frontend",
+                 "--cors",   "${CORS_ORIGINS:-https://yourdomain.com}"]
+
+    # Drop all Linux capabilities — the binary needs none.
+    cap_drop:
+      - ALL
+
+    # Read-only root filesystem; only /data is writable (via the named volume).
+    read_only: true
+
+    # Prevent the process from gaining new privileges.
+    security_opt:
+      - no-new-privileges:true
+
+    # Resource limits — tune to your VM size.
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 256M
+        reservations:
+          cpus: "0.25"
+          memory: 64M
+
+    healthcheck:
+      test: ["CMD-SHELL",
+             "wget -qO- http://localhost:8080/api/v1/healthz || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "5"
+
+volumes:
+  trade-data:
+    driver: local
