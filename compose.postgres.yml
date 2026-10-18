@@ -1,0 +1,41 @@
+# compose.postgres.yml — run the API against PostgreSQL instead of the JSON file.
+#
+#   POSTGRES_PASSWORD=... docker compose -f compose.yml -f compose.postgres.yml up -d
+#
+# First start from an existing state.json (once, while the API is stopped):
+#   docker compose -f compose.yml -f compose.postgres.yml run --rm --no-deps \
+#     -v trade-data:/data trade --migrate-state-from /data/state.json
+#
+# The API replicas are stateless: scale with `--scale trade=N` behind nginx.
+# sslmode=disable is acceptable ONLY because db is on the private compose
+# network; use sslmode=verify-full for any remote database.
+
+services:
+  db:
+    image: postgres:17-alpine@sha256:b0f9560a2de083e2cc7382e75f808c7381a32852a7ec49117deedb300e552b24
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: itp
+      POSTGRES_USER: itp
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}
+    volumes:
+      - pg-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U itp -d itp"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    # Not published: only the API (same compose network) can reach it.
+
+  trade:
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      - DATABASE_URL=postgres://itp:${POSTGRES_PASSWORD}@db:5432/itp?sslmode=disable
+
+volumes:
+  pg-data:
+    driver: local
+
+

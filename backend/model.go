@@ -9,6 +9,18 @@ type AppState struct {
 	Sessions map[string]*Session `json:"sessions"`
 	Trades   map[string]*Trade   `json:"trades"`
 	Bundles  map[string]*Bundle  `json:"bundles"`
+	// PendingActions holds dual-control proposals awaiting a second admin.
+	PendingActions map[string]*PendingAction `json:"pending_actions,omitempty"`
+	// Counts is filled only by the PostgreSQL store for scoped reads (a scoped
+	// state holds a subset of rows, so len(map) is not the real total).
+	Counts *StateCounts `json:"-"`
+}
+
+// StateCounts are database-side totals used by dashboard-style reads.
+type StateCounts struct {
+	Users, Colonies, Accounts, VisibleTrades int
+	AccountsByColony                         map[string]int
+	TradesByColony                           map[string]int
 }
 
 type Meta struct {
@@ -28,8 +40,15 @@ type Colony struct {
 	Outbox             []*Envelope         `json:"outbox"`
 	Ledger             []*LedgerEntry      `json:"ledger"`
 	NextLedgerSeq      int64               `json:"next_ledger_seq"`
-	NetObligations     map[string]int64    `json:"net_obligations"`
-	NetClaims          map[string]int64    `json:"net_claims"`
+	// LastLedgerHash lets appendLedger chain entries without holding the whole
+	// ledger in memory (the PostgreSQL store never loads it).
+	LastLedgerHash string           `json:"last_ledger_hash,omitempty"`
+	NetObligations map[string]int64 `json:"net_obligations"`
+	NetClaims      map[string]int64 `json:"net_claims"`
+	// Supply policy. MintCap==0 means DefaultMintCap.
+	MintedTotal        int64 `json:"minted_total,omitempty"`
+	MintCap            int64 `json:"mint_cap,omitempty"`
+	RequireDualControl bool  `json:"require_dual_control,omitempty"`
 }
 
 type Account struct {
@@ -50,6 +69,17 @@ type User struct {
 	PrivateKey   string   `json:"private_key"`
 	CreatedAt    string   `json:"created_at"`
 	Active       bool     `json:"active"`
+
+	// Phase 4 (all optional: documents written before it load unchanged).
+	FailedLogins      int    `json:"failed_logins,omitempty"`
+	LockedUntil       string `json:"locked_until,omitempty"`
+	MFAEnabled        bool   `json:"mfa_enabled,omitempty"`
+	MFASecret         string `json:"mfa_secret,omitempty"`         // base32 TOTP secret
+	MFAPendingSecret  string `json:"mfa_pending_secret,omitempty"` // enrolment not yet confirmed
+	MFALastStep       int64  `json:"mfa_last_step,omitempty"`      // last accepted TOTP step (replay guard)
+	ResetTokenHash    string `json:"reset_token_hash,omitempty"`   // sha256 of the one-time reset secret
+	ResetExpiresAt    string `json:"reset_expires_at,omitempty"`
+	PasswordChangedAt string `json:"password_changed_at,omitempty"`
 }
 
 type Session struct {
@@ -78,6 +108,10 @@ type Trade struct {
 	AcceptedAt           string `json:"accepted_at,omitempty"`
 	SettledAt            string `json:"settled_at,omitempty"`
 	CompletedAt          string `json:"completed_at,omitempty"`
+	ExpiresAt            string `json:"expires_at,omitempty"`
+	RefundedAt           string `json:"refunded_at,omitempty"`
+	CancelEnvelopeID     string `json:"cancel_envelope_id,omitempty"`
+	RefundEnvelopeID     string `json:"refund_envelope_id,omitempty"`
 }
 
 type LedgerEntry struct {
@@ -118,6 +152,8 @@ type OfferUserSignable struct {
 	BuyerUserID    string `json:"buyer_user_id"`
 	BuyerColonyID  string `json:"buyer_colony_id"`
 	CreatedAt      string `json:"created_at"`
+	// omitempty keeps signatures of pre-expiry offers byte-identical.
+	ExpiresAt string `json:"expires_at,omitempty"`
 }
 
 type OfferPayload struct {
@@ -131,6 +167,7 @@ type OfferPayload struct {
 	BuyerName       string `json:"buyer_name"`
 	BuyerColonyID   string `json:"buyer_colony_id"`
 	CreatedAt       string `json:"created_at"`
+	ExpiresAt       string `json:"expires_at,omitempty"`
 	SellerSignature string `json:"seller_signature"`
 }
 
@@ -158,6 +195,53 @@ type SettlementPayload struct {
 	CreditAmount       int64  `json:"credit_amount"`
 	AcceptedFromColony string `json:"accepted_from_colony"`
 	SettledAt          string `json:"settled_at"`
+}
+
+// CancelUserSignable / CancelPayload: the buyer asks the seller colony to refund
+// an acceptance it has not yet credited (envelope type "cancel_request").
+type CancelUserSignable struct {
+	TradeID       string `json:"trade_id"`
+	BuyerUserID   string `json:"buyer_user_id"`
+	BuyerColonyID string `json:"buyer_colony_id"`
+	RequestedAt   string `json:"requested_at"`
+}
+
+type CancelPayload struct {
+	TradeID        string `json:"trade_id"`
+	BuyerUserID    string `json:"buyer_user_id"`
+	BuyerColonyID  string `json:"buyer_colony_id"`
+	RequestedAt    string `json:"requested_at"`
+	BuyerSignature string `json:"buyer_signature"`
+}
+
+// RefundPayload is the seller colony's authoritative decision that it did NOT
+// credit the seller and the buyer must be refunded (envelope type "refund").
+type RefundPayload struct {
+	TradeID        string `json:"trade_id"`
+	BuyerUserID    string `json:"buyer_user_id"`
+	BuyerColonyID  string `json:"buyer_colony_id"`
+	SellerColonyID string `json:"seller_colony_id"`
+	RefundAmount   int64  `json:"refund_amount"`
+	Reason         string `json:"reason"`
+	DecidedAt      string `json:"decided_at"`
+}
+
+// PendingAction is a dual-control proposal: a different admin must approve it.
+type PendingAction struct {
+	ID          string `json:"id"`
+	Type        string `json:"type"` // mint | force_refund | policy
+	ColonyID    string `json:"colony_id"`
+	UserID      string `json:"user_id,omitempty"`
+	TradeID     string `json:"trade_id,omitempty"`
+	Amount      int64  `json:"amount,omitempty"`
+	MintCap     *int64 `json:"mint_cap,omitempty"`
+	RequireDual *bool  `json:"require_dual_control,omitempty"`
+	ProposedBy  string `json:"proposed_by"`
+	ProposedAt  string `json:"proposed_at"`
+	ExpiresAt   string `json:"expires_at"`
+	Status      string `json:"status"` // pending | approved | rejected
+	DecidedBy   string `json:"decided_by,omitempty"`
+	DecidedAt   string `json:"decided_at,omitempty"`
 }
 
 type envelopeSignable struct {
@@ -197,16 +281,20 @@ type UserView struct {
 	Roles       []string `json:"roles"`
 	CreatedAt   string   `json:"created_at"`
 	Active      bool     `json:"active"`
+	MFAEnabled  bool     `json:"mfa_enabled,omitempty"`
 }
 
 type ColonyView struct {
-	ID              string            `json:"id"`
-	Name            string            `json:"name"`
-	PublicKey       string            `json:"public_key"`
-	CreatedAt       string            `json:"created_at"`
-	TrustedColonies map[string]string `json:"trusted_colonies"`
-	NetObligations  map[string]int64  `json:"net_obligations"`
-	NetClaims       map[string]int64  `json:"net_claims"`
+	ID                 string            `json:"id"`
+	Name               string            `json:"name"`
+	PublicKey          string            `json:"public_key"`
+	CreatedAt          string            `json:"created_at"`
+	TrustedColonies    map[string]string `json:"trusted_colonies"`
+	NetObligations     map[string]int64  `json:"net_obligations"`
+	NetClaims          map[string]int64  `json:"net_claims"`
+	MintCap            int64             `json:"mint_cap"`
+	MintedTotal        int64             `json:"minted_total"`
+	RequireDualControl bool              `json:"require_dual_control"`
 }
 
 type AccountView struct {
@@ -238,6 +326,8 @@ type TradeView struct {
 	OfferEnvelopeID      string `json:"offer_envelope_id,omitempty"`
 	AcceptanceEnvelopeID string `json:"acceptance_envelope_id,omitempty"`
 	SettlementEnvelopeID string `json:"settlement_envelope_id,omitempty"`
+	ExpiresAt            string `json:"expires_at,omitempty"`
+	RefundedAt           string `json:"refunded_at,omitempty"`
 }
 
 type AuthResponse struct {
