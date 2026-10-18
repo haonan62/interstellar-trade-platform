@@ -2,7 +2,7 @@
 # cannot change what we ship. Dependabot (docker ecosystem) proposes updates.
 
 # ─── Stage 1: Build the React frontend ───────────────────────────────────────
-FROM node:22-alpine@sha256:0a7108bf6c7bf5de370ffb1a3ed6be93d405b43ff159f681a8d18c0e2bc2e402 AS frontend-builder
+FROM node:26-alpine@sha256:6f08a523443ddedf52941874c203475b0ad503e859ad70cb26ab8be9a517dbd5 AS frontend-builder
 
 WORKDIR /app/frontend
 # package-lock.json must be committed: `npm ci` fails without it.
