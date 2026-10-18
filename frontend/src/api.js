@@ -1,12 +1,15 @@
 const API_ROOT = "";
 
-async function request(path, { method = "GET", token, body } = {}) {
-  const headers = {};
-  if (token) headers.Authorization = `Bearer ${token}`;
+// Sessions are an HttpOnly cookie set by the server (X-Session-Mode: cookie);
+// JavaScript never sees the token, so XSS cannot read it from storage. The
+// `token` arguments below are kept only so callers did not need to change.
+async function request(path, { method = "GET", body, headers: extra } = {}) {
+  const headers = { "X-Session-Mode": "cookie", ...extra };
   if (body !== undefined) headers["Content-Type"] = "application/json";
   const res = await fetch(`${API_ROOT}${path}`, {
     method,
     headers,
+    credentials: "same-origin",
     body: body !== undefined ? JSON.stringify(body) : undefined,
   });
   const text = await res.text();
@@ -24,8 +27,12 @@ async function request(path, { method = "GET", token, body } = {}) {
 
 export const api = {
   needsBootstrap: () => request("/api/v1/bootstrap"),
-  bootstrap: (body) =>
-    request("/api/v1/auth/bootstrap", { method: "POST", body }),
+  bootstrap: (body, bootstrapToken) =>
+    request("/api/v1/auth/bootstrap", {
+      method: "POST",
+      body,
+      headers: { "X-Bootstrap-Token": bootstrapToken },
+    }),
   login: (body) => request("/api/v1/auth/login", { method: "POST", body }),
   logout: (token) => request("/api/v1/auth/logout", { method: "POST", token }),
   me: (token) => request("/api/v1/auth/me", { token }),

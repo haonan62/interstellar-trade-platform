@@ -279,7 +279,7 @@ function AuthScreen({ title, subtitle, children, message, messageSeverity, clear
 }
 
 export default function App() {
-  const [token, setToken] = useState(localStorage.getItem('itp_token')||'')
+  const [token, setToken] = useState('') // HttpOnly cookie holds the session; this is only a signed-in marker
   const [needsBootstrap, setNeedsBootstrap] = useState(true)
   const [user, setUser] = useState(null)
   const [section, setSection] = useState('Dashboard')
@@ -296,8 +296,8 @@ export default function App() {
   const [exportedBundle, setExportedBundle] = useState('')
   const [importBundleText, setImportBundleText] = useState('')
 
-  const [bootstrapForm, setBootstrapForm] = useState({ username:'admin',display_name:'Administrator',password:'' })
-  const [loginForm, setLoginForm] = useState({ username:'',password:'' })
+  const [bootstrapForm, setBootstrapForm] = useState({ username:'admin',display_name:'Administrator',password:'',bootstrap_token:'' })
+  const [loginForm, setLoginForm] = useState({ username:'',password:'',totp_code:'' })
   const [colonyForm, setColonyForm] = useState({ name:'' })
   const [trustForm, setTrustForm] = useState({ colony_id:'',peer_colony_id:'' })
   const [userForm, setUserForm] = useState({ username:'',display_name:'',password:'',colony_id:'',roles:['trader'] })
@@ -338,7 +338,8 @@ export default function App() {
   }
 
   useEffect(()=>{ api.needsBootstrap().then(v=>setNeedsBootstrap(v.needs_bootstrap)).catch(err=>notify(err.message,'error')) },[])
-  useEffect(()=>{ if(token){localStorage.setItem('itp_token',token);refresh(token)}else{localStorage.removeItem('itp_token');setUser(null)} },[token])
+  useEffect(()=>{ localStorage.removeItem('itp_token'); if(token){refresh(token)}else{setUser(null)} },[token]) // also wipes tokens stored by older versions
+  useEffect(()=>{ api.me().then(()=>setToken('session')).catch(()=>{}) },[]) // resume a cookie session
   useEffect(()=>{ if(selectedLedgerColony) refreshLedger(selectedLedgerColony) },[selectedLedgerColony])
 
   const logout = async () => {
@@ -360,7 +361,8 @@ export default function App() {
         <Inp label="Username" value={bootstrapForm.username} onChange={e=>setBootstrapForm({...bootstrapForm,username:e.target.value})} />
         <Inp label="Display name" value={bootstrapForm.display_name} onChange={e=>setBootstrapForm({...bootstrapForm,display_name:e.target.value})} />
         <Inp label="Password" type="password" value={bootstrapForm.password} onChange={e=>setBootstrapForm({...bootstrapForm,password:e.target.value})} helper="Use a strong password for the administrative account." />
-        <Btn onClick={async()=>{ try{const res=await api.bootstrap(bootstrapForm);setNeedsBootstrap(false);setToken(res.token);notify('Workspace initialized','success')}catch(err){notify(err.message,'error')} }} disabled={loading||!bootstrapForm.username||!bootstrapForm.password} style={{ width:'100%',justifyContent:'center',padding:14 }}>
+        <Inp label="Bootstrap token" type="password" value={bootstrapForm.bootstrap_token} onChange={e=>setBootstrapForm({...bootstrapForm,bootstrap_token:e.target.value})} helper="One-time secret from the server's BOOTSTRAP_TOKEN setting or start-up log." />
+        <Btn onClick={async()=>{ try{const {bootstrap_token,...body}=bootstrapForm;await api.bootstrap(body,bootstrap_token);setNeedsBootstrap(false);setToken('session');notify('Workspace initialized','success')}catch(err){notify(err.message,'error')} }} disabled={loading||!bootstrapForm.username||!bootstrapForm.password||!bootstrapForm.bootstrap_token} style={{ width:'100%',justifyContent:'center',padding:14 }}>
           {loading?<Spinner/>:null} Create administrator
         </Btn>
       </AuthScreen>
@@ -372,7 +374,8 @@ export default function App() {
       <AuthScreen title="Sign in" subtitle="Access colony administration, trading operations, and relay processing." message={message} messageSeverity={messageSeverity} clearMessage={clearMessage}>
         <Inp label="Username" value={loginForm.username} onChange={e=>setLoginForm({...loginForm,username:e.target.value})} />
         <Inp label="Password" type="password" value={loginForm.password} onChange={e=>setLoginForm({...loginForm,password:e.target.value})} />
-        <Btn onClick={async()=>{ try{const res=await api.login(loginForm);setToken(res.token);notify('Signed in successfully','success')}catch(err){notify(err.message,'error')} }} disabled={loading||!loginForm.username||!loginForm.password} style={{ width:'100%',justifyContent:'center',padding:14 }}>
+        <Inp label="One-time code (only if MFA is enabled)" value={loginForm.totp_code} onChange={e=>setLoginForm({...loginForm,totp_code:e.target.value})} />
+        <Btn onClick={async()=>{ try{const {totp_code,...rest}=loginForm;await api.login(totp_code?{...rest,totp_code}:rest);setToken('session');notify('Signed in successfully','success')}catch(err){notify(err.message,'error')} }} disabled={loading||!loginForm.username||!loginForm.password} style={{ width:'100%',justifyContent:'center',padding:14 }}>
           {loading?<Spinner/>:null} Sign in
         </Btn>
       </AuthScreen>

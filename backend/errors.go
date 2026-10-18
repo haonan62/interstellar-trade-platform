@@ -6,6 +6,9 @@ type AppError struct {
 	Status  int    `json:"-"`
 	Code    string `json:"code"`
 	Message string `json:"message"`
+	// Reason is for logs and audit only; it is never sent to the client, so a
+	// failed login can be recorded precisely without telling an attacker why.
+	Reason string `json:"-"`
 }
 
 func (e *AppError) Error() string { return e.Message }

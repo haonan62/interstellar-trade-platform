@@ -1,4 +1,4 @@
-# === macOS (system files – appear anywhere) ===
+# === macOS ===
 .DS_Store
 .AppleDouble
 .LSOverride
@@ -7,12 +7,15 @@
 .Trashes
 ehthumbs.db
 Thumbs.db
+*~
 *.swp
 *.swo
-*~
 
-# === Go (backend) ===
-# Build artifacts (adjust if your Go output goes elsewhere)
+# === IntelliJ IDEA / JetBrains ===
+.idea/
+*.iml
+
+# === Go backend ===
 /backend/bin/
 /backend/data/
 /backend/dist/
@@ -22,21 +25,23 @@ Thumbs.db
 /backend/*.dylib
 /backend/*.test
 /backend/coverage.out
-
-# Go vendor & workspace files
+/backend/coverage.html
 /backend/vendor/
 /backend/go.work
 /backend/go.work.sum
 
-# === Node.js / React (frontend) ===
-# Dependencies
+# Local compiled executable
+/backend/backend
+
+# === Node.js / React frontend ===
 /frontend/node_modules/
 /frontend/.pnp
 /frontend/.pnp.js
 /frontend/.yarn-integrity
-/frontend/package-lock.json
 
-# Build outputs (React)
+# Keep package-lock.json tracked for reproducible installs.
+
+# Build outputs
 /frontend/build/
 /frontend/dist/
 /frontend/.next/
@@ -49,16 +54,29 @@ Thumbs.db
 /frontend/lerna-debug.log*
 /frontend/.pnpm-debug.log*
 
-# Environment files
-/frontend/.env
-/frontend/.env.local
-/frontend/.env.*.local
-
-# Cache
+# Caches
 /frontend/.cache/
 /frontend/.parcel-cache/
 /frontend/.eslintcache
-
-# Testing coverage
+/frontend/.vite/
+/frontend/.turbo/
 /frontend/coverage/
 
+# === Environment files and secrets ===
+.env
+.env.*
+!.env.example
+!.env.sample
+
+/backend/.env
+/backend/.env.*
+!/backend/.env.example
+!/backend/.env.sample
+
+/frontend/.env
+/frontend/.env.*
+!/frontend/.env.example
+!/frontend/.env.sample
+
+# === Local backups ===
+backups/

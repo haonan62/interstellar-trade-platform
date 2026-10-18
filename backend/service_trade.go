@@ -4,14 +4,30 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
+	"time"
+)
+
+const (
+	DefaultOfferTTL = 7 * 24 * time.Hour
+	MinOfferTTL     = 60 * time.Second
+	MaxOfferTTL     = 90 * 24 * time.Hour
+	// PendingActionTTL is how long a dual-control proposal stays approvable.
+	PendingActionTTL = 72 * time.Hour
 )
 
 func (s *Service) CreateOffer(token string, req CreateOfferRequest) (TradeView, error) {
 	asset := strings.TrimSpace(req.Asset)
-	if asset == "" || req.Price <= 0 {
-		return TradeView{}, badRequest("asset and positive price are required")
+	if asset == "" || !validAmount(req.Price) {
+		return TradeView{}, badRequest("asset and a positive price within limits are required")
 	}
-	return StoreUpdate(s.store, func(state *AppState) (TradeView, error) {
+	ttl := DefaultOfferTTL
+	if req.TTLSeconds != 0 {
+		ttl = time.Duration(req.TTLSeconds) * time.Second
+		if ttl < MinOfferTTL || ttl > MaxOfferTTL {
+			return TradeView{}, badRequest("ttl_seconds must be between 60 and 7776000")
+		}
+	}
+	return StoreUpdateScoped(s.store, Scope{Tokens: []string{token}, Users: []string{req.SellerUserID, req.BuyerUserID}, UserColonies: true}, func(state *AppState) (TradeView, error) {
 		actor, err := actorFromToken(state, token)
 		if err != nil {
 			return TradeView{}, err
@@ -44,12 +60,13 @@ func (s *Service) CreateOffer(token string, req CreateOfferRequest) (TradeView, 
 			return TradeView{}, internalErr(err.Error())
 		}
 		createdAt := nowUTC()
-		signable := OfferUserSignable{TradeID: tradeID, Asset: asset, Price: req.Price, SellerUserID: seller.ID, SellerColonyID: seller.ColonyID, BuyerUserID: buyer.ID, BuyerColonyID: buyer.ColonyID, CreatedAt: createdAt}
+		expiresAt := nowFn().UTC().Add(ttl).Format(time.RFC3339)
+		signable := OfferUserSignable{TradeID: tradeID, Asset: asset, Price: req.Price, SellerUserID: seller.ID, SellerColonyID: seller.ColonyID, BuyerUserID: buyer.ID, BuyerColonyID: buyer.ColonyID, CreatedAt: createdAt, ExpiresAt: expiresAt}
 		sellerSig, err := signWithPrivateKey(seller.PrivateKey, signable)
 		if err != nil {
 			return TradeView{}, internalErr(err.Error())
 		}
-		payload := OfferPayload{TradeID: tradeID, Asset: asset, Price: req.Price, SellerUserID: seller.ID, SellerName: seller.DisplayName, SellerColonyID: seller.ColonyID, BuyerUserID: buyer.ID, BuyerName: buyer.DisplayName, BuyerColonyID: buyer.ColonyID, CreatedAt: createdAt, SellerSignature: sellerSig}
+		payload := OfferPayload{TradeID: tradeID, Asset: asset, Price: req.Price, SellerUserID: seller.ID, SellerName: seller.DisplayName, SellerColonyID: seller.ColonyID, BuyerUserID: buyer.ID, BuyerName: buyer.DisplayName, BuyerColonyID: buyer.ColonyID, CreatedAt: createdAt, ExpiresAt: expiresAt, SellerSignature: sellerSig}
 		envID, err := newID("env")
 		if err != nil {
 			return TradeView{}, internalErr(err.Error())
@@ -60,9 +77,9 @@ func (s *Service) CreateOffer(token string, req CreateOfferRequest) (TradeView, 
 			return TradeView{}, internalErr(err.Error())
 		}
 		sellerColony.Outbox = append(sellerColony.Outbox, env)
-		trade := &Trade{ID: tradeID, Asset: asset, Price: req.Price, SellerUserID: seller.ID, BuyerUserID: buyer.ID, SellerColonyID: seller.ColonyID, BuyerColonyID: buyer.ColonyID, Status: "offer_pending_export", OfferEnvelopeID: envID, SellerSignature: sellerSig, CreatedAt: createdAt}
+		trade := &Trade{ID: tradeID, Asset: asset, Price: req.Price, SellerUserID: seller.ID, BuyerUserID: buyer.ID, SellerColonyID: seller.ColonyID, BuyerColonyID: buyer.ColonyID, Status: StatusOfferPendingExport, OfferEnvelopeID: envID, SellerSignature: sellerSig, CreatedAt: createdAt, ExpiresAt: expiresAt}
 		state.Trades[trade.ID] = trade
-		if err := appendLedger(sellerColony, "trade_offer_created", actor.ID, map[string]any{"trade_id": trade.ID, "asset": trade.Asset, "price": trade.Price, "buyer_user_id": buyer.ID, "envelope_id": envID}); err != nil {
+		if err := appendLedger(sellerColony, "trade_offer_created", actor.ID, map[string]any{"trade_id": trade.ID, "asset": trade.Asset, "price": trade.Price, "buyer_user_id": buyer.ID, "envelope_id": envID, "expires_at": expiresAt}); err != nil {
 			return TradeView{}, internalErr(err.Error())
 		}
 		return toTradeView(state, trade), nil
@@ -70,7 +87,7 @@ func (s *Service) CreateOffer(token string, req CreateOfferRequest) (TradeView, 
 }
 
 func (s *Service) AcceptTrade(token, tradeID string) (TradeView, error) {
-	return StoreUpdate(s.store, func(state *AppState) (TradeView, error) {
+	return StoreUpdateScoped(s.store, Scope{Tokens: []string{token}, Trades: []string{tradeID}}, func(state *AppState) (TradeView, error) {
 		actor, err := actorFromToken(state, token)
 		if err != nil {
 			return TradeView{}, err
@@ -79,8 +96,11 @@ func (s *Service) AcceptTrade(token, tradeID string) (TradeView, error) {
 		if trade == nil {
 			return TradeView{}, notFound("trade not found")
 		}
-		if trade.Status != "offer_received" {
+		if trade.Status != StatusOfferReceived {
 			return TradeView{}, conflict("trade is not ready for acceptance")
+		}
+		if isExpired(trade, nowFn()) {
+			return TradeView{}, conflict("offer has expired")
 		}
 		buyer := state.Users[trade.BuyerUserID]
 		if buyer == nil {
@@ -103,7 +123,6 @@ func (s *Service) AcceptTrade(token, tradeID string) (TradeView, error) {
 		if acc.Balance < trade.Price {
 			return TradeView{}, conflict("insufficient buyer balance")
 		}
-		acc.Balance -= trade.Price
 		acceptedAt := nowUTC()
 		signable := AcceptanceUserSignable{TradeID: trade.ID, BuyerUserID: buyer.ID, BuyerColonyID: buyer.ColonyID, DebitAmount: trade.Price, AcceptedAt: acceptedAt}
 		buyerSig, err := signWithPrivateKey(buyer.PrivateKey, signable)
@@ -120,8 +139,12 @@ func (s *Service) AcceptTrade(token, tradeID string) (TradeView, error) {
 		if err != nil {
 			return TradeView{}, internalErr(err.Error())
 		}
+		// Everything that can fail has been computed; now apply.
+		acc.Balance -= trade.Price
 		buyerColony.Outbox = append(buyerColony.Outbox, env)
-		trade.Status = "acceptance_pending_export"
+		if err := advanceTrade(trade, StatusAcceptancePendingExport); err != nil {
+			return TradeView{}, err
+		}
 		trade.AcceptedAt = acceptedAt
 		trade.BuyerSignature = buyerSig
 		trade.AcceptanceEnvelopeID = envID
@@ -136,7 +159,7 @@ func (s *Service) ExportBundle(token string, req ExportBundleRequest) (Bundle, e
 	if req.ColonyID == "" || req.ToColonyID == "" {
 		return Bundle{}, badRequest("colony_id and to_colony_id are required")
 	}
-	return StoreUpdate(s.store, func(state *AppState) (Bundle, error) {
+	return StoreUpdateScoped(s.store, Scope{Tokens: []string{token}, Colonies: []string{req.ColonyID, req.ToColonyID}}, func(state *AppState) (Bundle, error) {
 		actor, err := actorFromToken(state, token)
 		if err != nil {
 			return Bundle{}, err
@@ -177,7 +200,7 @@ func (s *Service) ImportBundle(token string, req ImportBundleRequest) (ImportBun
 	if req.ColonyID == "" {
 		return ImportBundleResult{}, badRequest("colony_id is required")
 	}
-	return StoreUpdate(s.store, func(state *AppState) (ImportBundleResult, error) {
+	return StoreUpdateScoped(s.store, bundleScope(token, req), func(state *AppState) (ImportBundleResult, error) {
 		actor, err := actorFromToken(state, token)
 		if err != nil {
 			return ImportBundleResult{}, err
@@ -215,11 +238,17 @@ func (s *Service) ImportBundle(token string, req ImportBundleRequest) (ImportBun
 			if err := verifyEnvelope(source, env); err != nil {
 				return ImportBundleResult{}, badRequest(fmt.Sprintf("invalid envelope %s: %v", env.ID, err))
 			}
-			trade, kind, err := importEnvelope(state, source, target, env)
+			trade, kind, applied, err := importEnvelope(state, source, target, env)
 			if err != nil {
 				return ImportBundleResult{}, err
 			}
 			target.ProcessedEnvelopes[env.ID] = true
+			if !applied {
+				// Per-trade idempotency: this trade already passed this step
+				// (e.g. a re-wrapped replay under a new envelope ID).
+				result.SkippedDuplicates++
+				continue
+			}
 			result.ImportedCount++
 			result.ProcessedTypes = append(result.ProcessedTypes, kind)
 			if trade != nil {
@@ -235,118 +264,195 @@ func (s *Service) ImportBundle(token string, req ImportBundleRequest) (ImportBun
 	})
 }
 
-func importEnvelope(state *AppState, source, target *Colony, env *Envelope) (*Trade, string, error) {
+// importEnvelope applies one verified envelope. applied=false means the trade
+// had already passed this step and nothing was mutated.
+func importEnvelope(state *AppState, source, target *Colony, env *Envelope) (*Trade, string, bool, error) {
 	switch env.Type {
 	case "offer":
-		trade, err := importOffer(state, source, target, env)
-		return trade, "offer", err
+		trade, applied, err := importOffer(state, source, target, env)
+		return trade, "offer", applied, err
 	case "acceptance":
-		trade, err := importAcceptance(state, source, target, env)
-		return trade, "acceptance", err
+		trade, applied, err := importAcceptance(state, source, target, env)
+		return trade, "acceptance", applied, err
 	case "settlement":
-		trade, err := importSettlement(state, source, target, env)
-		return trade, "settlement", err
+		trade, applied, err := importSettlement(state, source, target, env)
+		return trade, "settlement", applied, err
+	case "cancel_request":
+		trade, applied, err := importCancel(state, source, target, env)
+		return trade, "cancel_request", applied, err
+	case "refund":
+		trade, applied, err := importRefund(state, source, target, env)
+		return trade, "refund", applied, err
 	default:
-		return nil, "", badRequest("unsupported envelope type")
+		return nil, "", false, badRequest("unsupported envelope type")
 	}
 }
-func importOffer(state *AppState, source, target *Colony, env *Envelope) (*Trade, error) {
+
+func importOffer(state *AppState, source, target *Colony, env *Envelope) (*Trade, bool, error) {
 	var payload OfferPayload
 	if err := json.Unmarshal(env.Payload, &payload); err != nil {
-		return nil, badRequest("invalid offer payload")
+		return nil, false, badRequest("invalid offer payload")
+	}
+	if payload.SellerColonyID != source.ID || payload.BuyerColonyID != target.ID {
+		return nil, false, badRequest("offer colonies do not match envelope route")
+	}
+	if !validAmount(payload.Price) || strings.TrimSpace(payload.Asset) == "" {
+		return nil, false, badRequest("offer has invalid asset or price")
 	}
 	seller, buyer := state.Users[payload.SellerUserID], state.Users[payload.BuyerUserID]
 	if seller == nil || buyer == nil {
-		return nil, notFound("seller or buyer not found")
+		return nil, false, notFound("seller or buyer not found")
 	}
-	signable := OfferUserSignable{TradeID: payload.TradeID, Asset: payload.Asset, Price: payload.Price, SellerUserID: payload.SellerUserID, SellerColonyID: payload.SellerColonyID, BuyerUserID: payload.BuyerUserID, BuyerColonyID: payload.BuyerColonyID, CreatedAt: payload.CreatedAt}
+	if seller.ColonyID != source.ID || buyer.ColonyID != target.ID {
+		return nil, false, badRequest("offer users do not belong to the stated colonies")
+	}
+	signable := OfferUserSignable{TradeID: payload.TradeID, Asset: payload.Asset, Price: payload.Price, SellerUserID: payload.SellerUserID, SellerColonyID: payload.SellerColonyID, BuyerUserID: payload.BuyerUserID, BuyerColonyID: payload.BuyerColonyID, CreatedAt: payload.CreatedAt, ExpiresAt: payload.ExpiresAt}
 	if err := verifyWithPublicKey(seller.PublicKey, signable, payload.SellerSignature); err != nil {
-		return nil, badRequest("invalid seller signature")
+		return nil, false, badRequest("invalid seller signature")
 	}
 	trade := state.Trades[payload.TradeID]
 	if trade == nil {
-		trade = &Trade{ID: payload.TradeID, Asset: payload.Asset, Price: payload.Price, SellerUserID: payload.SellerUserID, BuyerUserID: payload.BuyerUserID, SellerColonyID: payload.SellerColonyID, BuyerColonyID: payload.BuyerColonyID, CreatedAt: payload.CreatedAt, SellerSignature: payload.SellerSignature}
+		trade = &Trade{ID: payload.TradeID, Asset: payload.Asset, Price: payload.Price, SellerUserID: payload.SellerUserID, BuyerUserID: payload.BuyerUserID, SellerColonyID: payload.SellerColonyID, BuyerColonyID: payload.BuyerColonyID, CreatedAt: payload.CreatedAt, SellerSignature: payload.SellerSignature, Status: StatusOfferReceived, OfferEnvelopeID: env.ID, ExpiresAt: payload.ExpiresAt}
 		state.Trades[trade.ID] = trade
+	} else {
+		if trade.ExpiresAt != payload.ExpiresAt || trade.Asset != payload.Asset || trade.Price != payload.Price || trade.SellerUserID != payload.SellerUserID || trade.BuyerUserID != payload.BuyerUserID || trade.SellerColonyID != payload.SellerColonyID || trade.BuyerColonyID != payload.BuyerColonyID {
+			return nil, false, badRequest("offer does not match existing trade")
+		}
+		applied, err := stepTrade(trade, StatusOfferPendingExport, StatusOfferReceived)
+		if err != nil || !applied {
+			return trade, false, err
+		}
+		trade.OfferEnvelopeID = env.ID
+		trade.SellerSignature = payload.SellerSignature
 	}
-	trade.Status = "offer_received"
-	trade.OfferEnvelopeID = env.ID
-	trade.SellerSignature = payload.SellerSignature
 	if err := appendLedger(target, "trade_offer_imported", buyer.ID, map[string]any{"trade_id": trade.ID, "from_colony_id": source.ID, "offer_envelope_id": env.ID}); err != nil {
-		return nil, internalErr(err.Error())
+		return nil, false, internalErr(err.Error())
 	}
-	return trade, nil
+	return trade, true, nil
 }
-func importAcceptance(state *AppState, source, target *Colony, env *Envelope) (*Trade, error) {
+
+func importAcceptance(state *AppState, source, target *Colony, env *Envelope) (*Trade, bool, error) {
 	var payload AcceptancePayload
 	if err := json.Unmarshal(env.Payload, &payload); err != nil {
-		return nil, badRequest("invalid acceptance payload")
+		return nil, false, badRequest("invalid acceptance payload")
+	}
+	if payload.BuyerColonyID != source.ID {
+		return nil, false, badRequest("acceptance buyer colony does not match envelope source")
 	}
 	buyer := state.Users[payload.BuyerUserID]
 	if buyer == nil {
-		return nil, notFound("buyer not found")
+		return nil, false, notFound("buyer not found")
+	}
+	if buyer.ColonyID != source.ID {
+		return nil, false, badRequest("buyer does not belong to the source colony")
 	}
 	signable := AcceptanceUserSignable{TradeID: payload.TradeID, BuyerUserID: payload.BuyerUserID, BuyerColonyID: payload.BuyerColonyID, DebitAmount: payload.DebitAmount, AcceptedAt: payload.AcceptedAt}
 	if err := verifyWithPublicKey(buyer.PublicKey, signable, payload.BuyerSignature); err != nil {
-		return nil, badRequest("invalid buyer signature")
+		return nil, false, badRequest("invalid buyer signature")
 	}
 	trade := state.Trades[payload.TradeID]
 	if trade == nil {
-		return nil, notFound("trade not found")
+		return nil, false, notFound("trade not found")
 	}
-	if trade.SellerColonyID != target.ID || trade.BuyerColonyID != source.ID || trade.Price != payload.DebitAmount {
-		return nil, badRequest("acceptance payload does not match trade")
+	if trade.SellerColonyID != target.ID || trade.BuyerColonyID != source.ID || trade.BuyerUserID != buyer.ID || trade.Price != payload.DebitAmount {
+		return nil, false, badRequest("acceptance payload does not match trade")
 	}
 	seller := state.Users[trade.SellerUserID]
 	if seller == nil {
-		return nil, notFound("seller not found")
+		return nil, false, notFound("seller not found")
 	}
 	sellerAcc := target.Accounts[seller.ID]
 	if sellerAcc == nil {
-		return nil, notFound("seller account not found")
+		return nil, false, notFound("seller account not found")
 	}
-	sellerAcc.Balance += trade.Price
-	target.NetClaims[source.ID] += trade.Price
-	source.NetObligations[target.ID] += trade.Price
-	trade.Status = "settlement_pending_export"
+	// Decide idempotency / divergence first: nothing below may run for a trade
+	// that the seller colony has already resolved.
+	switch trade.Status {
+	case StatusAcceptancePendingExport:
+		late, err := acceptedAfterExpiry(trade, payload.AcceptedAt)
+		if err != nil {
+			return nil, false, err
+		}
+		if late {
+			return decideRefund(source, target, trade, env, "acceptance arrived after offer expiry")
+		}
+	case StatusExpired, StatusCancelled:
+		// The buyer was debited (AcceptanceEnvelopeID is only set by the buyer
+		// colony when it debits) but this seller colony already closed the offer.
+		if trade.AcceptanceEnvelopeID == "" {
+			return nil, false, conflict("acceptance for a closed offer without a recorded debit")
+		}
+		return decideRefund(source, target, trade, env, "offer was "+trade.Status+" before acceptance arrived")
+	default:
+		if classifyStep(trade.Status, StatusAcceptancePendingExport) == stepTooEarly {
+			return nil, false, conflict("trade is " + trade.Status + ", expected " + StatusAcceptancePendingExport)
+		}
+		return trade, false, nil // duplicate / already resolved: no balance change
+	}
+	// Validate everything that can fail BEFORE mutating anything.
+	newBalance, err := addChecked(sellerAcc.Balance, trade.Price)
+	if err != nil {
+		return nil, false, err
+	}
+	newClaims, err := addChecked(target.NetClaims[source.ID], trade.Price)
+	if err != nil {
+		return nil, false, err
+	}
+	newObligations, err := addChecked(source.NetObligations[target.ID], trade.Price)
+	if err != nil {
+		return nil, false, err
+	}
+	settledAt := nowUTC()
+	settlementPayload := SettlementPayload{TradeID: trade.ID, SellerUserID: seller.ID, SellerColonyID: target.ID, CreditAmount: trade.Price, AcceptedFromColony: source.ID, SettledAt: settledAt}
+	settlementEnvID, err := newID("env")
+	if err != nil {
+		return nil, false, internalErr(err.Error())
+	}
+	settlementEnv := &Envelope{ID: settlementEnvID, Type: "settlement", FromColonyID: target.ID, ToColonyID: source.ID, Payload: mustJSON(settlementPayload), CreatedAt: settledAt}
+	settlementEnv.ColonySignature, err = signEnvelope(target, settlementEnv)
+	if err != nil {
+		return nil, false, internalErr(err.Error())
+	}
+	if err := advanceTrade(trade, StatusSettlementPendingExport); err != nil {
+		return nil, false, err
+	}
+	sellerAcc.Balance = newBalance
+	target.NetClaims[source.ID] = newClaims
+	source.NetObligations[target.ID] = newObligations
 	trade.AcceptedAt = payload.AcceptedAt
 	trade.AcceptanceEnvelopeID = env.ID
 	trade.BuyerSignature = payload.BuyerSignature
-	trade.SettledAt = nowUTC()
-	settlementPayload := SettlementPayload{TradeID: trade.ID, SellerUserID: seller.ID, SellerColonyID: target.ID, CreditAmount: trade.Price, AcceptedFromColony: source.ID, SettledAt: trade.SettledAt}
-	settlementEnvID, err := newID("env")
-	if err != nil {
-		return nil, internalErr(err.Error())
-	}
-	settlementEnv := &Envelope{ID: settlementEnvID, Type: "settlement", FromColonyID: target.ID, ToColonyID: source.ID, Payload: mustJSON(settlementPayload), CreatedAt: trade.SettledAt}
-	settlementEnv.ColonySignature, err = signEnvelope(target, settlementEnv)
-	if err != nil {
-		return nil, internalErr(err.Error())
-	}
+	trade.SettledAt = settledAt
 	target.Outbox = append(target.Outbox, settlementEnv)
 	trade.SettlementEnvelopeID = settlementEnv.ID
 	if err := appendLedger(target, "trade_acceptance_imported", seller.ID, map[string]any{"trade_id": trade.ID, "acceptance_envelope_id": env.ID, "credited_amount": trade.Price, "new_balance": sellerAcc.Balance, "settlement_envelope_id": settlementEnv.ID}); err != nil {
-		return nil, internalErr(err.Error())
+		return nil, false, internalErr(err.Error())
 	}
-	return trade, nil
+	return trade, true, nil
 }
-func importSettlement(state *AppState, source, target *Colony, env *Envelope) (*Trade, error) {
+
+func importSettlement(state *AppState, source, target *Colony, env *Envelope) (*Trade, bool, error) {
 	var payload SettlementPayload
 	if err := json.Unmarshal(env.Payload, &payload); err != nil {
-		return nil, badRequest("invalid settlement payload")
+		return nil, false, badRequest("invalid settlement payload")
 	}
 	trade := state.Trades[payload.TradeID]
 	if trade == nil {
-		return nil, notFound("trade not found")
+		return nil, false, notFound("trade not found")
 	}
-	if trade.BuyerColonyID != target.ID || trade.SellerColonyID != source.ID || trade.Price != payload.CreditAmount {
-		return nil, badRequest("settlement payload does not match trade")
+	if payload.SellerColonyID != source.ID || payload.AcceptedFromColony != target.ID || payload.SellerUserID != trade.SellerUserID ||
+		trade.BuyerColonyID != target.ID || trade.SellerColonyID != source.ID || trade.Price != payload.CreditAmount {
+		return nil, false, badRequest("settlement payload does not match trade")
 	}
-	trade.Status = "completed"
+	applied, err := stepTrade(trade, StatusSettlementPendingExport, StatusCompleted)
+	if err != nil || !applied {
+		return trade, false, err
+	}
 	trade.SettledAt = payload.SettledAt
 	trade.CompletedAt = nowUTC()
 	trade.SettlementEnvelopeID = env.ID
 	if err := appendLedger(target, "trade_completed", trade.BuyerUserID, map[string]any{"trade_id": trade.ID, "settlement_envelope_id": env.ID, "completed_at": trade.CompletedAt}); err != nil {
-		return nil, internalErr(err.Error())
+		return nil, false, internalErr(err.Error())
 	}
-	return trade, nil
+	return trade, true, nil
 }

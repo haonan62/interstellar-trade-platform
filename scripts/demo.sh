@@ -20,7 +20,7 @@ print(obj)
 PY
 }
 
-BOOTSTRAP=$(curl -sS -X POST "$BASE_URL/api/v1/auth/bootstrap" -H 'Content-Type: application/json' -d '{"username":"admin","display_name":"Administrator","password":"ChangeMe123"}')
+BOOTSTRAP=$(curl -sS -X POST "$BASE_URL/api/v1/auth/bootstrap" -H "X-Bootstrap-Token: ${BOOTSTRAP_TOKEN:?set BOOTSTRAP_TOKEN to the server token}" -H 'Content-Type: application/json' -d '{"username":"admin","display_name":"Administrator","password":"ChangeMe123"}')
 TOKEN=$(extract "$BOOTSTRAP" token)
 
 EARTH=$(curl -sS -X POST "$BASE_URL/api/v1/colonies" -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' -d '{"name":"Earth"}')

@@ -4,7 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"log"
+	"log/slog"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -16,6 +16,10 @@ type API struct {
 	service        *Service
 	allowedOrigins map[string]bool
 	staticDir      string
+	metrics        *Metrics
+	// bootstrapToken gates POST /auth/bootstrap (header X-Bootstrap-Token).
+	// Empty means bootstrap is refused outright (fail closed).
+	bootstrapToken string
 }
 
 func NewAPI(service *Service, allowedOrigins []string, staticDir string) *API {
@@ -26,16 +30,18 @@ func NewAPI(service *Service, allowedOrigins []string, staticDir string) *API {
 			origins[o] = true
 		}
 	}
-	return &API{service: service, allowedOrigins: origins, staticDir: staticDir}
+	return &API{service: service, allowedOrigins: origins, staticDir: staticDir, metrics: NewMetrics()}
 }
 func (a *API) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /api/v1/healthz", a.handleHealthz)
+	mux.HandleFunc("GET /api/v1/readyz", a.handleReadyz)
 	mux.HandleFunc("GET /api/v1/bootstrap", a.handleNeedsBootstrap)
 	mux.HandleFunc("POST /api/v1/auth/bootstrap", a.handleBootstrap)
 	mux.HandleFunc("POST /api/v1/auth/login", a.handleLogin)
 	mux.HandleFunc("POST /api/v1/auth/logout", a.handleLogout)
 	mux.HandleFunc("GET /api/v1/auth/me", a.handleMe)
+	a.securityRoutes(mux)
 	mux.HandleFunc("GET /api/v1/dashboard", a.handleDashboard)
 	mux.HandleFunc("GET /api/v1/colonies", a.handleListColonies)
 	mux.HandleFunc("POST /api/v1/colonies", a.handleCreateColony)
@@ -48,6 +54,12 @@ func (a *API) Handler() http.Handler {
 	mux.HandleFunc("GET /api/v1/trades/{id}", a.handleGetTrade)
 	mux.HandleFunc("POST /api/v1/trades/offers", a.handleCreateOffer)
 	mux.HandleFunc("POST /api/v1/trades/{id}/accept", a.handleAcceptTrade)
+	mux.HandleFunc("POST /api/v1/trades/{id}/cancel", a.handleCancelTrade)
+	mux.HandleFunc("POST /api/v1/trades/{id}/force-refund", a.handleForceRefund)
+	mux.HandleFunc("POST /api/v1/colonies/{id}/policy", a.handleSetPolicy)
+	mux.HandleFunc("GET /api/v1/approvals", a.handleListApprovals)
+	mux.HandleFunc("POST /api/v1/approvals/{id}/approve", a.handleApprove)
+	mux.HandleFunc("POST /api/v1/approvals/{id}/reject", a.handleReject)
 	mux.HandleFunc("POST /api/v1/relay/export", a.handleExportBundle)
 	mux.HandleFunc("POST /api/v1/relay/import", a.handleImportBundle)
 	mux.HandleFunc("GET /api/v1/ledger", a.handleListLedger)
@@ -57,23 +69,17 @@ func (a *API) Handler() http.Handler {
 			mux.Handle("/", spaFileServer(a.staticDir, fs))
 		}
 	}
-	return a.withLogging(a.withCORS(mux))
-}
-func (a *API) withLogging(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/api/v1/healthz" {
-			log.Printf("%s %s", r.Method, r.URL.Path)
-		}
-		next.ServeHTTP(w, r)
-	})
+	return a.withObs(a.withSecurityHeaders(withBodyLimit(a.withCORS(a.withSession(mux)))))
 }
 func (a *API) withCORS(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		origin := r.Header.Get("Origin")
-		if origin != "" && (len(a.allowedOrigins) == 0 || a.allowedOrigins[origin]) {
+		// Fail closed: only explicitly allowed origins get CORS headers. The
+		// UI is served from the same origin and needs none.
+		if origin != "" && a.allowedOrigins[origin] {
 			w.Header().Set("Access-Control-Allow-Origin", origin)
 			w.Header().Set("Vary", "Origin")
-			w.Header().Set("Access-Control-Allow-Headers", "Authorization, Content-Type")
+			w.Header().Set("Access-Control-Allow-Headers", "Authorization, Content-Type, X-Session-Mode, X-Bootstrap-Token")
 			w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
 		}
 		if r.Method == http.MethodOptions {
@@ -87,6 +93,11 @@ func spaFileServer(root string, fs http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		path := filepath.Join(root, filepath.Clean(r.URL.Path))
 		if info, err := os.Stat(path); err == nil && !info.IsDir() {
+			if strings.HasPrefix(r.URL.Path, "/assets/") { // vite content-hashes these names
+				w.Header().Set("Cache-Control", "public, max-age=31536000, immutable")
+			} else {
+				w.Header().Set("Cache-Control", "no-cache")
+			}
 			fs.ServeHTTP(w, r)
 			return
 		}
@@ -94,11 +105,12 @@ func spaFileServer(root string, fs http.Handler) http.Handler {
 			http.NotFound(w, r)
 			return
 		}
+		w.Header().Set("Cache-Control", "no-cache")
 		http.ServeFile(w, r, filepath.Join(root, "index.html"))
 	})
 }
 func decodeJSON(r *http.Request, out any) error {
-	defer r.Body.Close()
+	defer func() { _ = r.Body.Close() }()
 	dec := json.NewDecoder(r.Body)
 	dec.DisallowUnknownFields()
 	if err := dec.Decode(out); err != nil {
@@ -117,7 +129,7 @@ func (a *API) writeError(w http.ResponseWriter, err error) {
 		writeJSON(w, appErr.Status, appErr)
 		return
 	}
-	log.Printf("internal error: %v", err)
+	slog.Error("internal error", "error", err.Error())
 	writeJSON(w, http.StatusInternalServerError, &AppError{Status: http.StatusInternalServerError, Code: "internal_error", Message: "internal server error"})
 }
 func (a *API) handleHealthz(w http.ResponseWriter, r *http.Request) {
@@ -132,6 +144,12 @@ func (a *API) handleNeedsBootstrap(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"needs_bootstrap": v})
 }
 func (a *API) handleBootstrap(w http.ResponseWriter, r *http.Request) {
+	// The one-time secret is checked before the body is even parsed.
+	if !a.bootstrapAllowed(r) {
+		a.audit(r, "auth.bootstrap", "failure", "reason", "bad_or_missing_bootstrap_token")
+		a.writeError(w, forbidden("a valid bootstrap token is required (X-Bootstrap-Token)"))
+		return
+	}
 	var req BootstrapRequest
 	if err := decodeJSON(r, &req); err != nil {
 		a.writeError(w, badRequest(err.Error()))
@@ -139,10 +157,13 @@ func (a *API) handleBootstrap(w http.ResponseWriter, r *http.Request) {
 	}
 	v, err := a.service.Bootstrap(req)
 	if err != nil {
+		a.audit(r, "auth.bootstrap", "failure", "reason", err.Error())
 		a.writeError(w, err)
 		return
 	}
-	writeJSON(w, http.StatusCreated, v)
+	reqInfoFrom(r.Context()).UserID = v.User.ID
+	a.audit(r, "auth.bootstrap", "success", "username", v.User.Username)
+	a.respondAuth(w, r, http.StatusCreated, v)
 }
 func (a *API) handleLogin(w http.ResponseWriter, r *http.Request) {
 	var req LoginRequest
@@ -152,16 +173,27 @@ func (a *API) handleLogin(w http.ResponseWriter, r *http.Request) {
 	}
 	v, err := a.service.Login(req)
 	if err != nil {
+		reason := ""
+		var ae *AppError
+		if errors.As(err, &ae) {
+			reason = ae.Reason
+		}
+		a.audit(r, "auth.login", "failure", "username", normalizeUsername(req.Username), "reason", reason)
+		a.metrics.Inc("itp_login_failures_total", "reason", metricReason(reason))
 		a.writeError(w, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, v)
+	reqInfoFrom(r.Context()).UserID = v.User.ID
+	a.audit(r, "auth.login", "success", "username", v.User.Username)
+	a.respondAuth(w, r, http.StatusOK, v)
 }
 func (a *API) handleLogout(w http.ResponseWriter, r *http.Request) {
-	if err := a.service.Logout(bearerToken(r.Header.Get("Authorization"))); err != nil {
+	if err := a.service.Logout(requestToken(r)); err != nil {
 		a.writeError(w, err)
 		return
 	}
+	a.clearSessionCookie(w, r)
+	a.audit(r, "auth.logout", "success")
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 }
 func (a *API) handleMe(w http.ResponseWriter, r *http.Request) {
@@ -249,7 +281,66 @@ func (a *API) handleMint(w http.ResponseWriter, r *http.Request) {
 		a.writeError(w, badRequest(err.Error()))
 		return
 	}
-	v, err := a.service.Mint(bearerToken(r.Header.Get("Authorization")), req)
+	v, err := a.service.MintOrPropose(bearerToken(r.Header.Get("Authorization")), req)
+	if err != nil {
+		a.writeError(w, err)
+		return
+	}
+	if v.Pending != nil {
+		// Dual control: nothing minted yet; a second admin must approve.
+		writeJSON(w, http.StatusAccepted, v.Pending)
+		return
+	}
+	writeJSON(w, http.StatusOK, v.Account)
+}
+
+func (a *API) token(r *http.Request) string { return bearerToken(r.Header.Get("Authorization")) }
+
+func (a *API) handleCancelTrade(w http.ResponseWriter, r *http.Request) {
+	v, err := a.service.CancelTrade(a.token(r), r.PathValue("id"))
+	if err != nil {
+		a.writeError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, v)
+}
+func (a *API) handleForceRefund(w http.ResponseWriter, r *http.Request) {
+	v, err := a.service.ProposeForceRefund(a.token(r), r.PathValue("id"))
+	if err != nil {
+		a.writeError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusAccepted, v)
+}
+func (a *API) handleSetPolicy(w http.ResponseWriter, r *http.Request) {
+	var req PolicyRequest
+	if err := decodeJSON(r, &req); err != nil {
+		a.writeError(w, badRequest(err.Error()))
+		return
+	}
+	v, err := a.service.SetPolicy(a.token(r), r.PathValue("id"), req)
+	if err != nil {
+		a.writeError(w, err)
+		return
+	}
+	if v.Pending != nil {
+		writeJSON(w, http.StatusAccepted, v.Pending)
+		return
+	}
+	writeJSON(w, http.StatusOK, v.Colony)
+}
+func (a *API) handleListApprovals(w http.ResponseWriter, r *http.Request) {
+	v, err := a.service.ListApprovals(a.token(r))
+	if err != nil {
+		a.writeError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, v)
+}
+func (a *API) handleApprove(w http.ResponseWriter, r *http.Request) { a.decide(w, r, true) }
+func (a *API) handleReject(w http.ResponseWriter, r *http.Request)  { a.decide(w, r, false) }
+func (a *API) decide(w http.ResponseWriter, r *http.Request, approve bool) {
+	v, err := a.service.DecideApproval(a.token(r), r.PathValue("id"), approve)
 	if err != nil {
 		a.writeError(w, err)
 		return
@@ -330,7 +421,16 @@ func (a *API) handleListLedger(w http.ResponseWriter, r *http.Request) {
 		}
 		limit = parsed
 	}
-	v, err := a.service.ListLedger(bearerToken(r.Header.Get("Authorization")), colonyID, limit)
+	var beforeSeq int64
+	if raw := r.URL.Query().Get("before_seq"); raw != "" {
+		parsed, err := strconv.ParseInt(raw, 10, 64)
+		if err != nil || parsed < 0 {
+			a.writeError(w, badRequest("invalid before_seq"))
+			return
+		}
+		beforeSeq = parsed
+	}
+	v, err := a.service.ListLedgerPage(bearerToken(r.Header.Get("Authorization")), colonyID, limit, beforeSeq)
 	if err != nil {
 		a.writeError(w, err)
 		return
