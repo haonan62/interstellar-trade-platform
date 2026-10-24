@@ -10,6 +10,7 @@ COPY frontend/package.json frontend/package-lock.json ./
 RUN npm ci --prefer-offline
 
 COPY frontend/ ./
+RUN npm run lint && npm test
 # The Go server serves the API and the static files on one origin, so the
 # frontend uses relative paths (/api/v1/...).
 RUN npm run build
@@ -25,7 +26,9 @@ COPY backend/go.mod backend/go.sum ./
 RUN go mod download
 
 COPY backend/ ./
-RUN CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="-s -w" -o /interstellar-trade .
+# VERSION is stamped into the binary (logged at start-up, printed by --version).
+ARG VERSION=dev
+RUN CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="-s -w -X main.version=${VERSION}" -o /interstellar-trade ./cmd/itp-server
 # An empty data directory owned by the runtime user (copied into the image below).
 RUN mkdir /data-skel
 

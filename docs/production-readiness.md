@@ -37,5 +37,4 @@ Verification scope: unit/integration tests with `-race` on the file store and on
 6. **Admin MFA is opt-in** (`REQUIRE_ADMIN_MFA`); a fresh deployment is single-factor until the runbook step is done.
 7. **Behaviour not proven under load**: lock contention, connection pool sizing (max 20), nginx limits, and Argon2 memory under a login flood were only tested functionally.
 8. **Image/dependency scanning in CI (trivy, govulncheck, npm audit) is configured; only govulncheck and npm audit were run locally.** Four unreachable Go-module advisories remain reported by govulncheck (not called by this code).
-9. Unit of work still in the working tree: **nothing is committed yet**; the changes of Phases 0–5 are uncommitted (and `frontend/package-lock.json` must be added).
 
