@@ -5,7 +5,7 @@
 | Item | Decision | Alternative rejected |
 |---|---|---|
 | Atomic updates | `StoreUpdate` runs the handler on a deep copy (JSON round-trip) and swaps it in only after the copy is durably written. Any handler error or persist error leaves memory and disk untouched. | Hand-ordering "validate then apply" in every handler: fragile, one miss reintroduces the bug. Kept as defence in depth (e.g. `importAcceptance` computes all checked sums before mutating). |
-| State machine | `trade_state.go`: explicit transition table; all status changes go through `advanceTrade` / `stepTrade`. | Ad-hoc string comparisons. |
+| State machine | `backend/internal/domain/trade_state.go`: explicit transition table; all status changes go through `AdvanceTrade` / `StepTrade`. | Ad-hoc string comparisons. |
 | Idempotency | Per trade and step: a message for a step the trade already passed is a no-op counted in `skipped_duplicates`; a message arriving before its predecessor state is a 409. | Rejecting duplicates with an error: poisons the whole (atomic) bundle. |
 | Import validation | Payload colony IDs must equal envelope source/target; users must belong to the stated colony; an offer for an existing trade must match its fields; settlement payload must match seller user/colony. | — |
 | Arithmetic | `addChecked`, `MaxAmount` (1e12) for prices and each mint. | — |

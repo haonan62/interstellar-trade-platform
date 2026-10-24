@@ -11,14 +11,26 @@ A full-stack proof-of-concept for delayed inter-colony digital trade: colonies h
 - Account lockout, optional TOTP MFA (required for admins on request), password reset, user deactivation, audit log
 - Colony-local balances and hash-chained ledgers, signed envelopes, async relay export/import
 - Trade state machine with expiry, cancel and refund; mint caps and optional dual control
-- React + Material UI frontend
+- React 19 + Material UI console (routing, role-aware navigation, light/dark theme, dual-control approvals, MFA enrolment)
 - Prometheus metrics, JSON logs, health/readiness probes
 
 ## Project layout
 
 ```text
-backend/            Go service (stdlib + pgx + x/crypto); migrations/ = PostgreSQL schema
-frontend/           React + Vite app
+backend/
+  cmd/itp-server/     entrypoint: flags, wiring, graceful shutdown
+  internal/domain/    data model, trade state machine, errors, signing/hashing, passwords, TOTP (no internal deps)
+  internal/storage/   Store: JSON file backend + PostgreSQL backend; migrations/ = embedded SQL schema
+  internal/service/   use cases (auth, admin, trades, relay, approvals, views); enforces authorization
+  internal/httpapi/   REST handlers and middleware (sessions/CSRF, CORS, security headers, limits, logs, metrics, audit)
+  test/integration/   cross-layer test suite (file store, or PostgreSQL with TEST_DATABASE_URL)
+frontend/src/
+  app/                App (providers, routes), theme, navigation
+  api/                HTTP client, one function per endpoint, React Query hooks
+  auth/               session provider, role helpers
+  components/         shared UI (layout shell, DataTable, dialogs, chips, empty states)
+  features/<area>/    one folder per screen: dashboard, trades, accounts, ledger, relay, approvals, colonies, users, settings, auth
+  lib/                formatting and domain constants
 deploy/             nginx.conf, nginx-http-bootstrap.conf, RUNBOOK.md
 docs/               design docs per phase, production-readiness checklist
 scripts/            demo.sh, pg_backup.sh, pg_restore_drill.sh, nginx_check.sh, smoke_security.sh
@@ -35,14 +47,16 @@ compose.postgres.yml  overlay: adds PostgreSQL and points the API at it
 | Tool | Version | Notes |
 |---|---|---|
 | Go | 1.25+ | matches `backend/go.mod` |
-| Node.js | 20+ (22 recommended) | Vite 7 does not run on older Node |
+| Node.js | 20.19+ (22 recommended, see `frontend/.nvmrc`) | Vite 7 does not run on older Node |
 | Docker | optional | only for PostgreSQL tests, image builds, `nginx -t` |
+
+Common tasks are wrapped in the root `Makefile`: `make help` lists them (`dev-backend`, `dev-frontend`, `lint`, `test`, `check`, `build`, `run`, `image`).
 
 ### 1. Run the backend
 
 ```bash
 cd backend
-BOOTSTRAP_TOKEN=dev-token go run . -addr :8080 -data ./data/state.json
+BOOTSTRAP_TOKEN=dev-token go run ./cmd/itp-server -addr :8080 -data ./data/state.json   # or: make dev-backend
 ```
 
 - State is stored in `backend/data/state.json` (git-ignored). Delete it to start from scratch.
@@ -54,7 +68,7 @@ BOOTSTRAP_TOKEN=dev-token go run . -addr :8080 -data ./data/state.json
 ```bash
 cd frontend
 npm install
-npm run dev          # http://localhost:5173
+npm run dev          # http://localhost:5173  (or: make dev-frontend)
 ```
 
 The Vite dev server proxies `/api` to `http://localhost:8080`, so the browser stays on one origin (no CORS setup needed; CORS is closed by default). On the first visit, the UI asks for the bootstrap token and creates the first administrator.
@@ -72,7 +86,7 @@ It bootstraps an admin, creates Earth and Mars, trusts them mutually, creates us
 ```bash
 docker run -d --name itp-pg -e POSTGRES_PASSWORD=itp -e POSTGRES_DB=itp -p 5432:5432 postgres:17-alpine
 cd backend
-BOOTSTRAP_TOKEN=dev-token go run . -addr :8080 \
+BOOTSTRAP_TOKEN=dev-token go run ./cmd/itp-server -addr :8080 \
   -database-url 'postgres://postgres:itp@localhost:5432/itp?sslmode=disable'
 ```
 
@@ -88,13 +102,20 @@ go test -race -count=1 ./...    # file store
 
 # same suite against a real PostgreSQL (extra PG-only tests run too)
 TEST_DATABASE_URL='postgres://postgres:itp@localhost:5432/itp?sslmode=disable' go test -race -count=1 ./...
+
+cd ../frontend
+npm run lint
+npm test                        # vitest
+npm run build
 ```
 
-Other checks: `./scripts/nginx_check.sh` (validates the nginx configs with `nginx -t` in Docker) and `go run golang.org/x/vuln/cmd/govulncheck@latest ./...`. CI (`.github/workflows/ci.yml`) runs all of these plus a frontend build, `npm audit` and an image scan.
+`make check` runs the backend and frontend lint and tests in one go.
+
+Other checks: `./scripts/nginx_check.sh` (validates the nginx configs with `nginx -t` in Docker) and `go run golang.org/x/vuln/cmd/govulncheck@latest ./...`. CI (`.github/workflows/ci.yml`) runs all of these plus the frontend lint/tests/build, `npm audit` and an image scan.
 
 ## Configuration
 
-Environment variables (or the equivalent flags; see `go run . -h`). Copy `.env.example` to `.env` for Docker Compose.
+Environment variables (or the equivalent flags; see `go run ./cmd/itp-server -h`). Copy `.env.example` to `.env` for Docker Compose.
 
 | Variable | Default | Purpose |
 |---|---|---|
@@ -106,16 +127,16 @@ Environment variables (or the equivalent flags; see `go run . -h`). Copy `.env.e
 | `LOG_LEVEL` | `info` | `debug`, `info`, `warn`, `error` |
 | `POSTGRES_PASSWORD` | required with `compose.postgres.yml` | database password |
 
-Flags without an environment variable: `-addr` (`:8080`), `-data` (state file path), `-static` (directory of built frontend files to serve).
+Flags without an environment variable: `-addr` (`:8080`), `-data` (state file path), `-static` (directory of built frontend files to serve), `-version`.
 
 ## Build
 
 ```bash
-docker build -t interstellar-trade:latest .
-# or: docker compose build
+docker build --build-arg VERSION=$(git describe --always) -t interstellar-trade:latest .
+# or: make image   /   docker compose build
 ```
 
-The multi-stage `Dockerfile` builds the React app (Node 22), compiles a static Go binary (Go 1.25), and produces a `FROM scratch` image that contains only the binary, CA certificates and the frontend assets. It runs as non-root user `65532`, and base images are pinned by digest (Dependabot proposes updates). `frontend/package-lock.json` must be committed because the build uses `npm ci`.
+The multi-stage `Dockerfile` builds the React app (Node 22), compiles a static Go binary (Go 1.25), and produces a `FROM scratch` image that contains only the binary, CA certificates and the frontend assets. It runs as non-root user `65532`, and base images are pinned by digest (Dependabot proposes updates). `frontend/package-lock.json` must be committed because the build uses `npm ci`. The frontend stage runs lint and unit tests, and `VERSION` is stamped into the binary (logged at start-up, printed by `--version`). Fonts are bundled, so the CSP allows no third-party origins.
 
 The Go server serves both the API and the built UI on port 8080.
 

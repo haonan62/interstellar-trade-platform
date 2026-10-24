@@ -1,0 +1,21 @@
+# Keep the build context small and free of local state and secrets.
+.git
+.github
+.env
+.env.*
+!.env.example
+**/.DS_Store
+backups/
+docs/
+deploy/
+scripts/
+
+frontend/node_modules
+frontend/dist
+frontend/coverage
+frontend/.vite
+
+backend/data
+backend/bin
+backend/*.test
+backend/coverage.*
